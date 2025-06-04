@@ -42,7 +42,11 @@ class GloveNode(Node):
         self.sensor_max_value = 8192 * 2
         self.min_val = [self.sensor_max_value] * 19
         self.max_val = [0] * 19
-        self.calibration_result = []
+        # self.calibration_result = []
+        self.avg_val = [0.0] * 19  # 存储19个传感器的平均校准值
+        # 校准参数 (可以考虑未来将它们也设为ROS参数)
+        self.calibration_samples_min_max = 1000  # 原来的校准样本数
+        self.calibration_samples_avg = 1000      # 静置平均校准的样本数
 
     def setup_serial_port(self):
         port = self.declare_parameter('port', '/dev/ttyUSB0').value
@@ -101,45 +105,114 @@ class GloveNode(Node):
             self.get_logger().error(f"Data validity check failed: {e}")
             return False
 
-    def calibrate(self, sample_count=1000):
+    def calibrate(self):
         import sys
         input("Press Enter to start calibration...")
-        self.get_logger().info(f"Starting calibration, collecting {sample_count} samples...")
+        self.get_logger().info(f"Starting calibration, collecting {self.calibration_samples_min_max} samples...")
         self.min_val = [self.sensor_max_value] * 19
         self.max_val = [0] * 19
-        collected = 0
-        last_progress = -1
-        while collected < sample_count:
+        collected_min_max = 0
+        last_progress_min_max = -1
+        while collected_min_max < self.calibration_samples_min_max:
             if self.serial_port.in_waiting > 0:
                 new_data = self.serial_port.read(self.serial_port.in_waiting)
                 self.data_buffer.extend(new_data)
-                while len(self.data_buffer) >= 132 and collected < sample_count:
+                while len(self.data_buffer) >= 132 and collected_min_max < self.calibration_samples_min_max:
                     packet = bytes([self.data_buffer.popleft() for _ in range(132)])
                     if self.is_valid_data(packet):
-                        hand_data = self.unpack_data(packet)
+                        hand_data = self.unpack_data(packet) # 注意: unpack_data 仍会动态更新 min_val/max_val
                         if hand_data:
+                            # 在此阶段也明确更新min_val和max_val
                             for i in range(19):
                                 val = hand_data['tensile_data'][i]
                                 if val < self.min_val[i]:
                                     self.min_val[i] = val
                                 if val > self.max_val[i]:
                                     self.max_val[i] = val
-                            collected += 1
-                            progress = int((collected / sample_count) * 50)
-                            if progress != last_progress:
+                            collected_min_max += 1
+                            progress = int((collected_min_max / self.calibration_samples_min_max) * 50)
+                            if progress != last_progress_min_max:
                                 bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
-                                print(f"\rCalibrating {bar} {collected}/{sample_count}", end='')
+                                print(f"\rrCalibrating {bar} {collected_min_max}/{self.calibration_samples_min_max}", end='')
                                 sys.stdout.flush()
-                                last_progress = progress
+                                last_progress_min_max = progress
         print()  # Newline after progress bar
+        self.get_logger().info(f"Min/max calibration completed!")
+        self.get_logger().info(f"Recorded min values: {self.min_val}")
+        self.get_logger().info(f"Recorded max values: {self.max_val}")
+
+        # --- 阶段 2: 静置平均值校准 (用户需保持手套静止) ---
+        input("Please keep the glove still. Press Enter to start the static average calibration...")
+        self.get_logger().info(f"Starting static average calibration, collecting {self.calibration_samples_avg} samples...")
+        tensile_sums = [0] * 19  # 用于累加每个传感器的值
+        collected_avg = 0
+        last_progress_avg = -1
+        
+        self.data_buffer.clear() 
+        while collected_avg < self.calibration_samples_avg:
+            if self.serial_port.in_waiting > 0:
+                new_data = self.serial_port.read(self.serial_port.in_waiting)
+                self.data_buffer.extend(new_data)
+                while len(self.data_buffer) >= 132 and collected_avg < self.calibration_samples_avg:
+                    packet = bytes([self.data_buffer.popleft() for _ in range(132)])
+                    if self.is_valid_data(packet):
+                        hand_data = self.unpack_data(packet) # unpack_data 仍会动态更新 min_val/max_val
+                        if hand_data:
+                            for i in range(19):
+                                tensile_sums[i] += hand_data['tensile_data'][i]
+                            collected_avg += 1
+                            progress = int((collected_avg / self.calibration_samples_avg) * 50)
+                            if progress != last_progress_avg:
+                                bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
+                                print(f"\rStatic average calibration in progress {bar} {collected_avg}/{self.calibration_samples_avg}", end='')
+                                sys.stdout.flush()
+                                last_progress_avg = progress
+        print()
+        if collected_avg > 0:
+            for i in range(19):
+                self.avg_val[i] = tensile_sums[i] / collected_avg
+        
+        self.get_logger().info(f"Static average calibration completed!")
+        self.get_logger().info(f"Calculated average values: {self.avg_val}")
+
+        # 所有校准阶段完成后
         self.is_calibrated = True
         self.get_logger().info(f"Calibration complete!")
         self.reader_thread.start()
 
     def inference(self, hand_data):
-        tensile_data = np.array(hand_data['tensile_data']).astype(np.float32)
-        outputs = self.ort_sess.run(None, {'input': tensile_data.reshape(1, -1)})
-        hand_data['inference'] = outputs[0][0]
+        # tensile_data = np.array(hand_data['tensile_data']).astype(np.float32)
+        # outputs = self.ort_sess.run(None, {'input': tensile_data.reshape(1, -1)})
+        # hand_data['inference'] = outputs[0][0]
+        # return hand_data
+
+        current_tensile_list = hand_data['tensile_data']
+        current_tensile_np = np.array(current_tensile_list).astype(np.float32)
+        avg_calibration_np = np.array(self.avg_val).astype(np.float32)
+
+        # 计算差值： 当前读数 - 静置时的平均读数
+        if current_tensile_np.shape == avg_calibration_np.shape:
+            tensile_difference_np = current_tensile_np - avg_calibration_np
+            # 你可以在这里添加一个调试日志来查看差值（可选）
+            # self.get_logger().debug(f"Tensile difference for model input: {tensile_difference_np.tolist()}")
+        else:
+            # 这种情况理论上不应该发生，因为 self.avg_val 和 tensile_data 都应该是19个元素
+            # 但作为一种保护措施，如果形状不匹配，则记录错误并使用原始数据（或进行其他错误处理）
+            self.get_logger().error(
+                f"Shape mismatch for tensile data subtraction: "
+                f"current_tensile_np shape: {current_tensile_np.shape}, "
+                f"avg_calibration_np shape: {avg_calibration_np.shape}. "
+                f"Using raw tensile data for inference instead."
+            )
+            tensile_difference_np = current_tensile_np # 回退到使用原始拉伸数据
+
+        # 将计算得到的差值数组调整为模型期望的输入形状 (1个样本, N个特征)
+        model_input_np = tensile_difference_np.reshape(1, -1)
+        
+        # 使用处理后的差值数据 (model_input_np) 执行ONNX模型推断
+        outputs = self.ort_sess.run(None, {'input': model_input_np})
+        hand_data['inference'] = outputs[0][0] 
+        
         return hand_data
 
 
