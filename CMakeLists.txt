@@ -15,7 +15,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 ament_export_dependencies(rosidl_default_runtime)
-ament_python_install_package(${PROJECT_NAME})
 
 install(
   DIRECTORY model
@@ -26,6 +25,7 @@ install(
   PROGRAMS
     glove_ros/serial_node.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME serial_node
 )
 
 ament_package()
