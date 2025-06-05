@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Header
@@ -16,67 +17,138 @@ from ament_index_python.packages import get_package_share_directory
 from queue import Queue
 from queue import Empty
 
+
 class GloveNode(Node):
+    # Protocol constants
+    PACKET_SIZE = 132
+    PACKET_HEADER_1 = 0xCB
+    PACKET_HEADER_2 = 0xCF
+    CRC_DATA_SIZE = 120
+    
+    # Data field offsets and sizes
+    TENSILE_DATA_OFFSET = 0
+    TENSILE_DATA_SIZE = 76  # 19 int32 * 4 bytes
+    ACC_DATA_OFFSET = 76
+    ACC_DATA_SIZE = 12      # 3 float * 4 bytes
+    GYRO_DATA_OFFSET = 88
+    GYRO_DATA_SIZE = 12     # 3 float * 4 bytes
+    MAG_DATA_OFFSET = 100
+    MAG_DATA_SIZE = 12      # 3 float * 4 bytes
+    TEMP_DATA_OFFSET = 112
+    TEMP_DATA_SIZE = 4      # 1 float * 4 bytes
+    TIMESTAMP_OFFSET = 116
+    TIMESTAMP_SIZE = 4      # 1 uint32 * 4 bytes
+    
+    # Sensor constants
+    NUM_TENSILE_SENSORS = 19
+    NUM_IMU_AXES = 3
+    SENSOR_MAX_VALUE = 8192 * 2
+    
+    # Buffer and timing constants
+    DATA_BUFFER_SIZE = 5000
+    DEFAULT_CALIBRATION_SAMPLES = 1000
+    DEFAULT_BAUDRATE = 1000000
+    
+    # Validation thresholds
+    MAX_ACCELERATION = 100.0    # g-force
+    MAX_ANGULAR_VELOCITY = 2000.0  # degrees/second
+    
+    # Thread timing constants
+    QUEUE_TIMEOUT_SHORT = 0.01  # 10ms
+    QUEUE_TIMEOUT_LONG = 0.1    # 100ms
+    WAIT_TIME_SHORT = 0.001     # 1ms
+    WAIT_TIME_MEDIUM = 0.01     # 10ms
+    WAIT_TIME_LONG = 1.0        # 1s
+
     def __init__(self):
         super().__init__('glove_node')
         
+        # Publisher setup
         self.glove_publisher = self.create_publisher(GloveDataMsg, '/glove/data', 10)
         
-        # Declare inference_mode parameter (default: False)
+        # Inference mode setup
         self.inference_mode = self.declare_parameter('inference_mode', False).value
         if self.inference_mode:
-            self.get_logger().info("Inference mode enabled")
-            pkg_share = get_package_share_directory('glove_ros')
-            model_path = os.path.join(pkg_share, 'model', '20250417_165613_test.onnx')
-            self.get_logger().info(f"Loading model from: {model_path}")
-            if not os.path.exists(model_path):
-                self.get_logger().error(f"Model file not found at: {model_path}")
-                self.inference_mode = False
-            else:
-                self.ort_sess = ort.InferenceSession(model_path)
+            self._setup_inference_model()
         
-        # 设置两个串口
-        self.left_serial_port = self.setup_serial_port('left_port', '/dev/ttyUSB0')
-        self.right_serial_port = self.setup_serial_port('right_port', '/dev/ttyUSB1')
+        # Serial port setup
+        self.left_serial_port = self._setup_serial_port('left_port', '/dev/ttyUSB0')
+        self.right_serial_port = self._setup_serial_port('right_port', '/dev/ttyUSB1')
         
+        # Thread control
         self.running = True
         self.is_calibrated = False
         
-        # 为每个串口创建独立的数据缓冲区
-        self.left_data_buffer = collections.deque(maxlen=5000)
-        self.right_data_buffer = collections.deque(maxlen=5000)
+        # Data buffers for each hand
+        self.left_data_buffer = collections.deque(maxlen=self.DATA_BUFFER_SIZE)
+        self.right_data_buffer = collections.deque(maxlen=self.DATA_BUFFER_SIZE)
         
-        # 为左右手分别创建校准参数
-        self.sensor_max_value = 8192 * 2
-        self.left_min_val = [self.sensor_max_value] * 19
-        self.left_max_val = [0] * 19
-        self.left_avg_val = [0.0] * 19
-        self.right_min_val = [self.sensor_max_value] * 19
-        self.right_max_val = [0] * 19
-        self.right_avg_val = [0.0] * 19
+        # Calibration parameters for each hand
+        self._init_calibration_parameters()
         
-        # 校准参数
-        self.calibration_samples_min_max = 1000
-        self.calibration_samples_avg = 1000
-        
-        # 创建数据队列用于线程间通信
+        # Data queues for thread communication
         self.left_data_queue = Queue()
         self.right_data_queue = Queue()
         
-        # 创建两个独立的读取线程和一个处理线程
-        self.left_reader_thread = Thread(target=self.read_and_publish_data, args=(self.left_serial_port, self.left_data_buffer, 'left'), daemon=True)
-        self.right_reader_thread = Thread(target=self.read_and_publish_data, args=(self.right_serial_port, self.right_data_buffer, 'right'), daemon=True)
-        self.process_thread = Thread(target=self.process_and_publish_data, daemon=True)
+        # Thread setup
+        self._init_threads()
 
-    def setup_serial_port(self, param_name, default_port):
-        """设置串口参数"""
+    def _setup_inference_model(self):
+        """Initialize ONNX inference model"""
+        self.get_logger().info("Inference mode enabled")
+        pkg_share = get_package_share_directory('glove_ros')
+        model_path = os.path.join(pkg_share, 'model', '20250417_165613_test.onnx')
+        self.get_logger().info(f"Loading model from: {model_path}")
+        
+        if not os.path.exists(model_path):
+            self.get_logger().error(f"Model file not found at: {model_path}")
+            self.inference_mode = False
+        else:
+            self.ort_sess = ort.InferenceSession(model_path)
+
+    def _init_calibration_parameters(self):
+        """Initialize calibration parameters for both hands"""
+        self.calibration_samples_min_max = self.DEFAULT_CALIBRATION_SAMPLES
+        self.calibration_samples_avg = self.DEFAULT_CALIBRATION_SAMPLES
+        
+        # Left hand calibration data
+        self.left_min_val = [self.SENSOR_MAX_VALUE] * self.NUM_TENSILE_SENSORS
+        self.left_max_val = [0] * self.NUM_TENSILE_SENSORS
+        self.left_avg_val = [0.0] * self.NUM_TENSILE_SENSORS
+        
+        # Right hand calibration data
+        self.right_min_val = [self.SENSOR_MAX_VALUE] * self.NUM_TENSILE_SENSORS
+        self.right_max_val = [0] * self.NUM_TENSILE_SENSORS
+        self.right_avg_val = [0.0] * self.NUM_TENSILE_SENSORS
+
+    def _init_threads(self):
+        """Initialize worker threads"""
+        self.left_reader_thread = Thread(
+            target=self._read_and_publish_data,
+            args=(self.left_serial_port, self.left_data_buffer, 'left'),
+            daemon=True
+        )
+        self.right_reader_thread = Thread(
+            target=self._read_and_publish_data,
+            args=(self.right_serial_port, self.right_data_buffer, 'right'),
+            daemon=True
+        )
+        self.process_thread = Thread(
+            target=self._process_and_publish_data,
+            daemon=True
+        )
+
+    def _setup_serial_port(self, param_name, default_port):
+        """Setup serial port with parameters"""
         port = self.declare_parameter(param_name, default_port).value
-        # 只在第一次调用时声明baudrate参数
+        
+        # Declare baudrate parameter only once
         if not hasattr(self, '_baudrate_declared'):
-            self.baudrate = self.declare_parameter('baudrate', 1000000).value
+            self.baudrate = self.declare_parameter('baudrate', self.DEFAULT_BAUDRATE).value
             self._baudrate_declared = True
         
         self.get_logger().info(f"Setting up {param_name} on {port} with baudrate {self.baudrate}")
+        
         try:
             ser = serial.Serial(port, self.baudrate, timeout=1)
             self.get_logger().info(f"Successfully opened {param_name} on {port}")
@@ -85,339 +157,313 @@ class GloveNode(Node):
             self.get_logger().error(f"Failed to open {param_name} on {port}: {e}")
             raise
 
-    def check_frame_validity(self, data, offset):
-        """Check the validity of the data frame
-        1. Check if timestamp is within a reasonable range
-        2. Check if tensile sensor data is within a reasonable range
-        3. Check if IMU data is within a reasonable range
-        """
+    def _is_valid_data(self, data):
+        """Validate data packet integrity"""
         try:
-            # Check tensile sensor data (first 19 int32)
-            for i in range(19):
-                val = struct.unpack('<i', data[offset+i*4:offset+(i+1)*4])[0]
-                # print(f"Tensile sensor {i}: {val}")
-                if not (0 <= val <= self.sensor_max_value - 1):  # Tensile value should be in reasonable range
-                    print(f"Tensile sensor {i}: {val}")
-                    return False
-            
-            # Check accelerometer data (3 floats)
-            acc_offset = offset + 19*4
-            for i in range(3):
-                val = struct.unpack('<f', data[acc_offset+i*4:acc_offset+(i+1)*4])[0]
-                if abs(val) > 100:  # Acceleration generally won't exceed 16g
-                    print(f"Accelerometer {i}: {val}")
-                    return False
-            
-            # Check gyroscope data (3 floats)
-            gyro_offset = acc_offset + 3*4
-            for i in range(3):
-                val = struct.unpack('<f', data[gyro_offset+i*4:gyro_offset+(i+1)*4])[0]
-                if abs(val) > 2000:  # Angular velocity generally won't exceed 2000 degrees/second
-                    print(f"Gyroscope {i}: {val}")
-                    return False
-            
-            return True
-        except Exception:
-            return False
-
-
-    def is_valid_data(self, data):
-        """检查数据包的有效性"""
-        try:
-            if len(data) != 132:
+            # Check packet length
+            if len(data) != self.PACKET_SIZE:
                 self.get_logger().error(f"Invalid packet length: {len(data)} bytes")
                 return False
-                
-            # 检查数据包头部特征
-            # if data[0] != 0xCB or data[1] != 0xCF:
-            #     self.get_logger().error(f"Invalid packet header: {[hex(b) for b in data[:2]]}")
-            #     return False
             
-            # 检查CRC32
+            # Validate CRC32 checksum
             received_crc = struct.unpack('<I', data[-4:])[0]
-            computed_crc = zlib.crc32(data[:120]) & 0xFFFFFFFF
+            computed_crc = zlib.crc32(data[:self.CRC_DATA_SIZE]) & 0xFFFFFFFF
             
             if computed_crc != received_crc:
-                self.get_logger().error(f"CRC validation failed:")
+                self.get_logger().error("CRC validation failed:")
                 self.get_logger().error(f"  - Computed CRC: {computed_crc:08X}")
                 self.get_logger().error(f"  - Received CRC: {received_crc:08X}")
                 self.get_logger().error(f"  - Data length: {len(data)}")
-                self.get_logger().error(f"  - First 10 bytes: {[hex(b) for b in data[:10]]}")
-                self.get_logger().error(f"  - Last 10 bytes: {[hex(b) for b in data[-10:]]}")
                 return False
             
             return True
+            
         except Exception as e:
             self.get_logger().error(f"Data validation error: {e}")
             return False
 
     def calibrate(self):
-        import sys
-        # 左手最大最小值校准
+        """Perform calibration sequence for both hands"""
+        # Left hand min/max calibration
         self.get_logger().info("Starting left hand min/max calibration...")
         input("Please keep your left hand still. Press Enter to start left hand min/max calibration...")
-        self.calibrate_min_max('left')
+        self._calibrate_min_max('left')
         
-        # 右手最大最小值校准
+        # Right hand min/max calibration
         self.get_logger().info("Starting right hand min/max calibration...")
         input("Please keep your right hand still. Press Enter to start right hand min/max calibration...")
-        self.calibrate_min_max('right')
+        self._calibrate_min_max('right')
         
-        # 左手静止平均值校准
+        # Left hand static average calibration
         self.get_logger().info("Starting left hand static average calibration...")
         input("Please keep your left hand still. Press Enter to start left hand static average calibration...")
-        self.calibrate_static_average('left')
+        self._calibrate_static_average('left')
         
-        # 右手静止平均值校准
+        # Right hand static average calibration
         self.get_logger().info("Starting right hand static average calibration...")
         input("Please keep your right hand still. Press Enter to start right hand static average calibration...")
-        self.calibrate_static_average('right')
+        self._calibrate_static_average('right')
         
-        # 所有校准阶段完成后
+        # Start all threads after calibration
         self.is_calibrated = True
         self.get_logger().info("Calibration complete!")
         self.left_reader_thread.start()
         self.right_reader_thread.start()
         self.process_thread.start()
 
-    def calibrate_min_max(self, hand_type):
-        """为指定的手进行最大最小值校准"""
-        import sys
-        self.get_logger().info(f"Starting {hand_type} hand min/max calibration, collecting {self.calibration_samples_min_max} samples...")
+    def _calibrate_min_max(self, hand_type):
+        """Calibrate min/max values for specified hand"""
+        self.get_logger().info(
+            f"Starting {hand_type} hand min/max calibration, "
+            f"collecting {self.calibration_samples_min_max} samples..."
+        )
         
-        # 选择对应的串口、缓冲区和校准参数
-        serial_port = self.left_serial_port if hand_type == 'left' else self.right_serial_port
-        data_buffer = self.left_data_buffer if hand_type == 'left' else self.right_data_buffer
-        min_val = self.left_min_val if hand_type == 'left' else self.right_min_val
-        max_val = self.left_max_val if hand_type == 'left' else self.right_max_val
+        # Select hand-specific parameters
+        serial_port, data_buffer, min_val, max_val = self._get_hand_parameters(hand_type)
         
-        # 重置校准参数
-        min_val[:] = [self.sensor_max_value] * 19
-        max_val[:] = [0] * 19
+        # Reset calibration parameters
+        min_val[:] = [self.SENSOR_MAX_VALUE] * self.NUM_TENSILE_SENSORS
+        max_val[:] = [0] * self.NUM_TENSILE_SENSORS
         
-        collected_min_max = 0
-        last_progress_min_max = -1
-        
-        # 清空缓冲区
+        # Clear buffer and wait for stable data
         data_buffer.clear()
+        self._clear_serial_buffer(serial_port)
+        time.sleep(self.WAIT_TIME_LONG)
         
-        # 等待数据稳定
-        time.sleep(1)
+        self._log_serial_port_status(hand_type, serial_port)
+        self._wait_for_first_valid_packet(hand_type, serial_port)
         
-        self.get_logger().info(f"Starting data collection for {hand_type} hand...")
+        # Collect calibration data
+        collected = 0
+        last_progress = -1
         
-        # 先读取一些数据，确保数据流稳定
-        while serial_port.in_waiting >= 132:  # 只读取完整的132字节数据包
-            data = serial_port.read(132)
-            self.get_logger().debug(f"Cleared one complete packet of 132 bytes")
+        while collected < self.calibration_samples_min_max:
+            if serial_port.in_waiting >= self.PACKET_SIZE:
+                packet = serial_port.read(self.PACKET_SIZE)
+                if len(packet) == self.PACKET_SIZE and self._is_valid_data(packet):
+                    hand_data = self._unpack_data(packet, hand_type)
+                    if hand_data:
+                        self._update_min_max_values(hand_data, min_val, max_val)
+                        collected += 1
+                        last_progress = self._update_progress_bar(
+                            collected, self.calibration_samples_min_max,
+                            f"{hand_type} hand calibrating", last_progress
+                        )
+                else:
+                    self.get_logger().debug(f"Invalid data packet for {hand_type} hand")
+            else:
+                time.sleep(self.WAIT_TIME_SHORT)
+        
+        print()
+        self._log_calibration_results(hand_type, "min/max", min_val, max_val, collected)
+
+    def _calibrate_static_average(self, hand_type):
+        """Calibrate static average values for specified hand"""
+        self.get_logger().info(
+            f"Starting {hand_type} hand static average calibration, "
+            f"collecting {self.calibration_samples_avg} samples..."
+        )
+        
+        # Initialize accumulator
+        tensile_sums = [0] * self.NUM_TENSILE_SENSORS
+        
+        # Select hand-specific parameters
+        serial_port, data_buffer, _, _ = self._get_hand_parameters(hand_type)
+        data_buffer.clear()
+        time.sleep(self.WAIT_TIME_LONG)
+        
+        # Collect calibration data
+        collected = 0
+        last_progress = -1
+        
+        while collected < self.calibration_samples_avg:
+            if serial_port.in_waiting >= self.PACKET_SIZE:
+                packet = serial_port.read(self.PACKET_SIZE)
+                if self._is_valid_data(packet):
+                    data = self._unpack_data(packet, hand_type)
+                    if data:
+                        for i in range(self.NUM_TENSILE_SENSORS):
+                            tensile_sums[i] += data['tensile_data'][i]
+                        collected += 1
+                        last_progress = self._update_progress_bar(
+                            collected, self.calibration_samples_avg,
+                            f"{hand_type} hand calibration in progress", last_progress
+                        )
+            time.sleep(self.WAIT_TIME_SHORT)
+        
+        print()
+        self.get_logger().info(f"{hand_type} hand static average calibration completed!")
+        
+        # Calculate and store averages
+        if collected > 0:
+            avg_values = self.left_avg_val if hand_type == 'left' else self.right_avg_val
+            for i in range(self.NUM_TENSILE_SENSORS):
+                avg_values[i] = tensile_sums[i] / collected
+        
+        self.get_logger().info(f"{hand_type} hand average values: {avg_values}")
+
+    def _get_hand_parameters(self, hand_type):
+        """Get hand-specific parameters"""
+        if hand_type == 'left':
+            return (self.left_serial_port, self.left_data_buffer,
+                    self.left_min_val, self.left_max_val)
+        else:
+            return (self.right_serial_port, self.right_data_buffer,
+                    self.right_min_val, self.right_max_val)
+
+    def _clear_serial_buffer(self, serial_port):
+        """Clear complete packets from serial buffer"""
+        while serial_port.in_waiting >= self.PACKET_SIZE:
+            data = serial_port.read(self.PACKET_SIZE)
+            self.get_logger().debug("Cleared one complete packet of 132 bytes")
         time.sleep(0.1)
-        
-        # 检查串口状态
+
+    def _log_serial_port_status(self, hand_type, serial_port):
+        """Log serial port configuration"""
         self.get_logger().info(f"{hand_type} hand serial port status:")
         self.get_logger().info(f"  - Port: {serial_port.port}")
         self.get_logger().info(f"  - Baudrate: {serial_port.baudrate}")
         self.get_logger().info(f"  - Bytesize: {serial_port.bytesize}")
         self.get_logger().info(f"  - Parity: {serial_port.parity}")
         self.get_logger().info(f"  - Stopbits: {serial_port.stopbits}")
-        
-        # 等待第一个有效的数据包
+
+    def _wait_for_first_valid_packet(self, hand_type, serial_port):
+        """Wait for the first valid data packet"""
         self.get_logger().info(f"Waiting for first valid data packet from {hand_type} hand...")
         first_packet = None
+        
         while first_packet is None:
-            if serial_port.in_waiting >= 132:
-                packet = serial_port.read(132)
-                if len(packet) == 132 and self.is_valid_data(packet):
+            if serial_port.in_waiting >= self.PACKET_SIZE:
+                packet = serial_port.read(self.PACKET_SIZE)
+                if len(packet) == self.PACKET_SIZE and self._is_valid_data(packet):
                     first_packet = packet
                     self.get_logger().info(f"Received first valid packet from {hand_type} hand")
                 else:
-                    self.get_logger().debug(f"Invalid first packet, waiting for next...")
-            time.sleep(0.001)
-        
-        # 开始收集数据
-        while collected_min_max < self.calibration_samples_min_max:
-            if serial_port.in_waiting >= 132:
-                packet = serial_port.read(132)
-                if len(packet) == 132:
-                    if self.is_valid_data(packet):
-                        hand_data = self.unpack_data(packet, hand_type)
-                        if hand_data:
-                            for i in range(19):
-                                val = hand_data['tensile_data'][i]
-                                if val < min_val[i]:
-                                    min_val[i] = val
-                                if val > max_val[i]:
-                                    max_val[i] = val
-                            collected_min_max += 1
-                            progress = int((collected_min_max / self.calibration_samples_min_max) * 50)
-                            if progress != last_progress_min_max:
-                                bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
-                                print(f"\r{hand_type} hand calibrating {bar} {collected_min_max}/{self.calibration_samples_min_max}", end='')
-                                sys.stdout.flush()
-                                last_progress_min_max = progress
-                    else:
-                        self.get_logger().debug(f"Invalid data packet for {hand_type} hand")
-                else:
-                    self.get_logger().error(f"Read incomplete packet: {len(packet)} bytes")
-            else:
-                # 如果没有足够的数据，等待一小段时间
-                time.sleep(0.001)
-        
-        print()
-        self.get_logger().info(f"{hand_type} hand min/max calibration completed!")
+                    self.get_logger().debug("Invalid first packet, waiting for next...")
+            time.sleep(self.WAIT_TIME_SHORT)
+
+    def _update_min_max_values(self, hand_data, min_val, max_val):
+        """Update min/max calibration values"""
+        for i in range(self.NUM_TENSILE_SENSORS):
+            val = hand_data['tensile_data'][i]
+            if val < min_val[i]:
+                min_val[i] = val
+            if val > max_val[i]:
+                max_val[i] = val
+
+    def _update_progress_bar(self, current, total, message, last_progress):
+        """Update and display progress bar"""
+        progress = int((current / total) * 50)
+        if progress != last_progress:
+            bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
+            print(f"\r{message} {bar} {current}/{total}", end='')
+            import sys
+            sys.stdout.flush()
+        return progress
+
+    def _log_calibration_results(self, hand_type, calibration_type, min_val, max_val, collected):
+        """Log calibration results"""
+        self.get_logger().info(f"{hand_type} hand {calibration_type} calibration completed!")
         self.get_logger().info(f"Recorded min values: {min_val}")
         self.get_logger().info(f"Recorded max values: {max_val}")
-        self.get_logger().info(f"Total samples collected: {collected_min_max}")
+        self.get_logger().info(f"Total samples collected: {collected}")
 
-    def calibrate_static_average(self, hand_type):
-        """分别进行左右手的静止平均值校准"""
-        import sys
-        self.get_logger().info(f"Starting {hand_type} hand static average calibration, collecting {self.calibration_samples_avg} samples...")
-        
-        # 初始化累加器
-        tensile_sums = [0] * 19
-        
-        # 清空缓冲区
-        if hand_type == 'left':
-            self.left_data_buffer.clear()
-            serial_port = self.left_serial_port
-        else:
-            self.right_data_buffer.clear()
-            serial_port = self.right_serial_port
-        
-        # 等待数据稳定
-        time.sleep(1)
-        
-        collected = 0
-        last_progress = -1
-        
-        while collected < self.calibration_samples_avg:
-            if serial_port.in_waiting >= 132:
-                packet = serial_port.read(132)
-                if self.is_valid_data(packet):
-                    data = self.unpack_data(packet, hand_type)
-                    if data:
-                        for i in range(19):
-                            tensile_sums[i] += data['tensile_data'][i]
-                        collected += 1
-                        progress = int((collected / self.calibration_samples_avg) * 50)
-                        if progress != last_progress:
-                            bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
-                            print(f"\r{hand_type} hand calibration in progress {bar} {collected}/{self.calibration_samples_avg}", end='')
-                            sys.stdout.flush()
-                            last_progress = progress
-            time.sleep(0.001)
-        
-        print()
-        self.get_logger().info(f"{hand_type} hand static average calibration completed!")
-        
-        # 计算平均值
-        if collected > 0:
-            if hand_type == 'left':
-                for i in range(19):
-                    self.left_avg_val[i] = tensile_sums[i] / collected
-            else:
-                for i in range(19):
-                    self.right_avg_val[i] = tensile_sums[i] / collected
-        
-        self.get_logger().info(f"{hand_type} hand average values: {self.left_avg_val if hand_type == 'left' else self.right_avg_val}")
-
-    def read_and_publish_data(self, serial_port, data_buffer, hand_type):
-        """读取串口数据并放入队列"""
+    def _read_and_publish_data(self, serial_port, data_buffer, hand_type):
+        """Read serial data and queue for processing"""
         while self.running:
             if serial_port.in_waiting > 0:
                 new_data = serial_port.read(serial_port.in_waiting)
                 data_buffer.extend(new_data)
 
-                while len(data_buffer) >= 132:
-                    packet = bytes([data_buffer.popleft() for _ in range(132)])
-                    if self.is_valid_data(packet):
-                        hand_data = self.unpack_data(packet, hand_type)
+                while len(data_buffer) >= self.PACKET_SIZE:
+                    packet = bytes([data_buffer.popleft() for _ in range(self.PACKET_SIZE)])
+                    if self._is_valid_data(packet):
+                        hand_data = self._unpack_data(packet, hand_type)
                         if hand_data:
-                            # 将数据放入对应的队列
+                            # Queue data for processing
                             if hand_type == 'left':
                                 self.left_data_queue.put(hand_data)
                             else:
                                 self.right_data_queue.put(hand_data)
 
-    def process_and_publish_data(self):
-        """处理队列中的数据并发布"""
+    def _process_and_publish_data(self):
+        """Process queued data and publish combined messages"""
         left_data = None
         right_data = None
         
         while self.running:
             try:
-                # 尝试从左手队列获取数据
+                # Try to get data from left queue
                 if left_data is None:
                     try:
-                        left_data = self.left_data_queue.get(timeout=0.01)
+                        left_data = self.left_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
                     except Empty:
                         pass
                 
-                # 尝试从右手队列获取数据
+                # Try to get data from right queue
                 if right_data is None:
                     try:
-                        right_data = self.right_data_queue.get(timeout=0.01)
+                        right_data = self.right_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
                     except Empty:
                         pass
                 
-                # 当两个手都有数据时，进行推理和发布
+                # Process and publish when both hands have data
                 if left_data is not None and right_data is not None:
-                    # 如果启用推理模式，分别对左右手数据进行推理
                     if self.inference_mode:
-                        left_data = self.inference(left_data, 'left')
-                        right_data = self.inference(right_data, 'right')
+                        left_data = self._perform_inference(left_data, 'left')
+                        right_data = self._perform_inference(right_data, 'right')
                     
-                    # 发布合并后的数据
-                    self.publish_data(left_data, right_data)
+                    self._publish_combined_data(left_data, right_data)
                     
-                    # 重置数据
+                    # Reset data
                     left_data = None
                     right_data = None
                 
-                # 如果只有一个手有数据，短暂等待另一个手的数据
+                # Wait strategy based on data availability
                 elif left_data is not None or right_data is not None:
-                    time.sleep(0.001)  # 等待1ms让另一个手的数据到达
+                    time.sleep(self.WAIT_TIME_SHORT)  # Wait for other hand
                 else:
-                    time.sleep(0.01)   # 如果都没有数据，等待10ms
+                    time.sleep(self.WAIT_TIME_MEDIUM)  # No data available
                 
             except Exception as e:
                 self.get_logger().error(f"Error processing data: {e}")
-                time.sleep(0.01)
+                time.sleep(self.WAIT_TIME_MEDIUM)
 
-    def inference(self, hand_data, hand_type):
-        """对指定手的数据进行推理"""
-        current_tensile_list = hand_data['tensile_data']
-        current_tensile_np = np.array(current_tensile_list).astype(np.float32)
-        avg_calibration_np = np.array(self.left_avg_val if hand_type == 'left' else self.right_avg_val).astype(np.float32)
+    def _perform_inference(self, hand_data, hand_type):
+        """Perform inference on hand data"""
+        current_tensile = np.array(hand_data['tensile_data']).astype(np.float32)
+        avg_calibration = np.array(
+            self.left_avg_val if hand_type == 'left' else self.right_avg_val
+        ).astype(np.float32)
 
-        # 计算差值： 当前读数 - 静置时的平均读数
-        if current_tensile_np.shape == avg_calibration_np.shape:
-            tensile_difference_np = current_tensile_np - avg_calibration_np
+        # Calculate difference from calibrated baseline
+        if current_tensile.shape == avg_calibration.shape:
+            tensile_difference = current_tensile - avg_calibration
         else:
             self.get_logger().error(
                 f"Shape mismatch for tensile data subtraction: "
-                f"current_tensile_np shape: {current_tensile_np.shape}, "
-                f"avg_calibration_np shape: {avg_calibration_np.shape}. "
-                f"Using raw tensile data for inference instead."
+                f"current shape: {current_tensile.shape}, "
+                f"calibration shape: {avg_calibration.shape}. "
+                f"Using raw tensile data for inference."
             )
-            tensile_difference_np = current_tensile_np
+            tensile_difference = current_tensile
 
-        # 将计算得到的差值数组调整为模型期望的输入形状 (1个样本, N个特征)
-        model_input_np = tensile_difference_np.reshape(1, -1)
+        # Reshape for model input
+        model_input = tensile_difference.reshape(1, -1)
         
-        # 使用处理后的差值数据执行ONNX模型推断
-        outputs = self.ort_sess.run(None, {'input': model_input_np})
-        hand_data['inference'] = outputs[0][0] 
+        # Run inference
+        outputs = self.ort_sess.run(None, {'input': model_input})
+        hand_data['inference'] = outputs[0][0]
         
         return hand_data
 
-    def publish_data(self, left_data, right_data):
-        """发布左右手数据"""
+    def _publish_combined_data(self, left_data, right_data):
+        """Publish combined left and right hand data"""
         msg = GloveDataMsg()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
         
-        # 左手数据
+        # Left hand data
         msg.left_linear_acceleration = list(left_data['acc_data'])
         msg.left_angular_velocity = list(left_data['gyro_data'])
         msg.left_temperature = float(left_data['temperature'])
@@ -425,7 +471,7 @@ class GloveNode(Node):
         if self.inference_mode:
             msg.left_joint_angles = left_data['inference'].tolist()
         
-        # 右手数据
+        # Right hand data
         msg.right_linear_acceleration = list(right_data['acc_data'])
         msg.right_angular_velocity = list(right_data['gyro_data'])
         msg.right_temperature = float(right_data['temperature'])
@@ -433,12 +479,13 @@ class GloveNode(Node):
         if self.inference_mode:
             msg.right_joint_angles = right_data['inference'].tolist()
         
-        # 使用左手的时间戳（或者可以取两个时间戳的平均值）
+        # Use left hand timestamp as reference
         msg.timestamp = int(left_data['timestamp'])
         
         self.glove_publisher.publish(msg)
 
     def stop(self):
+        """Stop all threads and close serial ports"""
         self.running = False
         self.left_reader_thread.join()
         self.right_reader_thread.join()
@@ -446,31 +493,38 @@ class GloveNode(Node):
         self.left_serial_port.close()
         self.right_serial_port.close()
 
-    def unpack_data(self, data, hand_type):
-        """解析串口数据"""
+    def _unpack_data(self, data, hand_type):
+        """Unpack serial data into structured format"""
         try:
-            # First validate CRC
-            # received_crc = struct.unpack('<I', data[-4:])[0]
-            # computed_crc = zlib.crc32(data[:120]) & 0xFFFFFFFF
-            
-            # if computed_crc != received_crc:
-            #     self.get_logger().error(f"CRC validation failed: Computed={computed_crc:08X}, Received={received_crc:08X}")
-            #     return None
+            # Unpack data fields with proper offsets
+            tensile_data = struct.unpack(
+                f'<{self.NUM_TENSILE_SENSORS}i',
+                data[self.TENSILE_DATA_OFFSET:self.TENSILE_DATA_OFFSET + self.TENSILE_DATA_SIZE]
+            )
+            acc_data = struct.unpack(
+                f'<{self.NUM_IMU_AXES}f',
+                data[self.ACC_DATA_OFFSET:self.ACC_DATA_OFFSET + self.ACC_DATA_SIZE]
+            )
+            gyro_data = struct.unpack(
+                f'<{self.NUM_IMU_AXES}f',
+                data[self.GYRO_DATA_OFFSET:self.GYRO_DATA_OFFSET + self.GYRO_DATA_SIZE]
+            )
+            mag_data = struct.unpack(
+                f'<{self.NUM_IMU_AXES}f',
+                data[self.MAG_DATA_OFFSET:self.MAG_DATA_OFFSET + self.MAG_DATA_SIZE]
+            )
+            temperature = struct.unpack(
+                '<f',
+                data[self.TEMP_DATA_OFFSET:self.TEMP_DATA_OFFSET + self.TEMP_DATA_SIZE]
+            )[0]
+            timestamp = struct.unpack(
+                '<I',
+                data[self.TIMESTAMP_OFFSET:self.TIMESTAMP_OFFSET + self.TIMESTAMP_SIZE]
+            )[0]
 
-            # Unpack the data fields separately to avoid alignment issues
-            tensile_data = struct.unpack('<19i', data[:76])  # 19 integers (76 bytes)
-            acc_data = struct.unpack('<3f', data[76:88])     # 3 floats (12 bytes)
-            gyro_data = struct.unpack('<3f', data[88:100])   # 3 floats (12 bytes)
-            mag_data = struct.unpack('<3f', data[100:112])   # 3 floats (12 bytes)
-            temperature = struct.unpack('<f', data[112:116])[0]  # 1 float (4 bytes)
-            timestamp = struct.unpack('<I', data[116:120])[0]    # 1 uint32 (4 bytes)
-            # Reserve bytes and CRC are in the remaining 12 bytes
-
-            # 根据手部类型选择对应的校准参数
-            min_val = self.left_min_val if hand_type == 'left' else self.right_min_val
-            max_val = self.left_max_val if hand_type == 'left' else self.right_max_val
-
-            for i in range(19):
+            # Update calibration parameters during operation
+            min_val, max_val = self._get_calibration_values(hand_type)
+            for i in range(self.NUM_TENSILE_SENSORS):
                 if tensile_data[i] < min_val[i]:
                     min_val[i] = tensile_data[i]
                 if tensile_data[i] > max_val[i]:
@@ -488,10 +542,20 @@ class GloveNode(Node):
             self.get_logger().error(f"Failed to unpack data: {e}")
             return None
 
+    def _get_calibration_values(self, hand_type):
+        """Get calibration values for specified hand"""
+        if hand_type == 'left':
+            return self.left_min_val, self.left_max_val
+        else:
+            return self.right_min_val, self.right_max_val
+
+
 def main(args=None):
+    """Main entry point"""
     rclpy.init(args=args)
     node = GloveNode()
     node.calibrate()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -500,6 +564,7 @@ def main(args=None):
         node.stop()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
