@@ -60,7 +60,8 @@ class GloveNode(Node):
         self.calibration_samples_avg = 1000
         
         # 创建数据队列用于线程间通信
-        self.data_queue = Queue()
+        self.left_data_queue = Queue()
+        self.right_data_queue = Queue()
         
         # 创建两个独立的读取线程和一个处理线程
         self.left_reader_thread = Thread(target=self.read_and_publish_data, args=(self.left_serial_port, self.left_data_buffer, 'left'), daemon=True)
@@ -172,6 +173,7 @@ class GloveNode(Node):
         self.get_logger().info("Calibration complete!")
         self.left_reader_thread.start()
         self.right_reader_thread.start()
+        self.process_thread.start()
 
     def calibrate_min_max(self, hand_type):
         """为指定的手进行最大最小值校准"""
@@ -331,8 +333,11 @@ class GloveNode(Node):
                     if self.is_valid_data(packet):
                         hand_data = self.unpack_data(packet, hand_type)
                         if hand_data:
-                            # 将数据放入队列，包含手部类型信息
-                            self.data_queue.put((hand_type, hand_data))
+                            # 将数据放入对应的队列
+                            if hand_type == 'left':
+                                self.left_data_queue.put(hand_data)
+                            else:
+                                self.right_data_queue.put(hand_data)
 
     def process_and_publish_data(self):
         """处理队列中的数据并发布"""
@@ -341,14 +346,19 @@ class GloveNode(Node):
         
         while self.running:
             try:
-                # 从队列中获取数据，设置超时以便能够响应停止信号
-                hand_type, hand_data = self.data_queue.get(timeout=0.1)
+                # 尝试从左手队列获取数据
+                if left_data is None:
+                    try:
+                        left_data = self.left_data_queue.get(timeout=0.01)
+                    except Empty:
+                        pass
                 
-                # 根据手部类型存储数据
-                if hand_type == 'left':
-                    left_data = hand_data
-                else:
-                    right_data = hand_data
+                # 尝试从右手队列获取数据
+                if right_data is None:
+                    try:
+                        right_data = self.right_data_queue.get(timeout=0.01)
+                    except Empty:
+                        pass
                 
                 # 当两个手都有数据时，进行推理和发布
                 if left_data is not None and right_data is not None:
@@ -364,11 +374,15 @@ class GloveNode(Node):
                     left_data = None
                     right_data = None
                 
-            except Empty:
-                # 队列为空，继续等待
-                continue
+                # 如果只有一个手有数据，短暂等待另一个手的数据
+                elif left_data is not None or right_data is not None:
+                    time.sleep(0.001)  # 等待1ms让另一个手的数据到达
+                else:
+                    time.sleep(0.01)   # 如果都没有数据，等待10ms
+                
             except Exception as e:
                 self.get_logger().error(f"Error processing data: {e}")
+                time.sleep(0.01)
 
     def inference(self, hand_data, hand_type):
         """对指定手的数据进行推理"""
