@@ -74,7 +74,15 @@ class GloveNode(Node):
         if not hasattr(self, '_baudrate_declared'):
             self.baudrate = self.declare_parameter('baudrate', 1000000).value
             self._baudrate_declared = True
-        return serial.Serial(port, self.baudrate, timeout=1)
+        
+        self.get_logger().info(f"Setting up {param_name} on {port} with baudrate {self.baudrate}")
+        try:
+            ser = serial.Serial(port, self.baudrate, timeout=1)
+            self.get_logger().info(f"Successfully opened {param_name} on {port}")
+            return ser
+        except Exception as e:
+            self.get_logger().error(f"Failed to open {param_name} on {port}: {e}")
+            raise
 
     def check_frame_validity(self, data, offset):
         """Check the validity of the data frame
@@ -116,30 +124,26 @@ class GloveNode(Node):
         """检查数据包的有效性"""
         try:
             if len(data) != 132:
+                self.get_logger().error(f"Invalid packet length: {len(data)} bytes")
                 return False
                 
+            # 检查数据包头部特征
+            if data[0] != 0xCB or data[1] != 0xCF:
+                self.get_logger().error(f"Invalid packet header: {[hex(b) for b in data[:2]]}")
+                return False
+            
             # 检查CRC32
             received_crc = struct.unpack('<I', data[-4:])[0]
             computed_crc = zlib.crc32(data[:120]) & 0xFFFFFFFF
             
             if computed_crc != received_crc:
-                self.get_logger().error(f"CRC validation failed: Computed={computed_crc:08X}, Received={received_crc:08X}")
+                self.get_logger().error(f"CRC validation failed:")
+                self.get_logger().error(f"  - Computed CRC: {computed_crc:08X}")
+                self.get_logger().error(f"  - Received CRC: {received_crc:08X}")
+                self.get_logger().error(f"  - Data length: {len(data)}")
+                self.get_logger().error(f"  - First 10 bytes: {[hex(b) for b in data[:10]]}")
+                self.get_logger().error(f"  - Last 10 bytes: {[hex(b) for b in data[-10:]]}")
                 return False
-            
-            # 检查拉伸传感器数据范围
-            for i in range(19):
-                val = struct.unpack('<i', data[i*4:(i+1)*4])[0]
-                if not (0 <= val <= self.sensor_max_value - 1):
-                    return False
-            
-            # 检查IMU数据范围
-            acc_offset = 76
-            gyro_offset = 88
-            for i in range(3):
-                acc_val = struct.unpack('<f', data[acc_offset+i*4:acc_offset+(i+1)*4])[0]
-                gyro_val = struct.unpack('<f', data[gyro_offset+i*4:gyro_offset+(i+1)*4])[0]
-                if abs(acc_val) > 100 or abs(gyro_val) > 2000:
-                    return False
             
             return True
         except Exception as e:
@@ -195,14 +199,38 @@ class GloveNode(Node):
         
         self.get_logger().info(f"Starting data collection for {hand_type} hand...")
         
+        # 先读取一些数据，确保数据流稳定
+        while serial_port.in_waiting > 0:
+            data = serial_port.read(serial_port.in_waiting)
+            self.get_logger().debug(f"Cleared {len(data)} bytes from buffer")
+        time.sleep(0.1)
+        
+        # 检查串口状态
+        self.get_logger().info(f"{hand_type} hand serial port status:")
+        self.get_logger().info(f"  - Port: {serial_port.port}")
+        self.get_logger().info(f"  - Baudrate: {serial_port.baudrate}")
+        self.get_logger().info(f"  - Bytesize: {serial_port.bytesize}")
+        self.get_logger().info(f"  - Parity: {serial_port.parity}")
+        self.get_logger().info(f"  - Stopbits: {serial_port.stopbits}")
+        
+        # 等待第一个有效的数据包
+        self.get_logger().info(f"Waiting for first valid data packet from {hand_type} hand...")
+        first_packet = None
+        while first_packet is None:
+            if serial_port.in_waiting >= 132:
+                packet = serial_port.read(132)
+                if len(packet) == 132 and self.is_valid_data(packet):
+                    first_packet = packet
+                    self.get_logger().info(f"Received first valid packet from {hand_type} hand")
+                else:
+                    self.get_logger().debug(f"Invalid first packet, waiting for next...")
+            time.sleep(0.001)
+        
+        # 开始收集数据
         while collected_min_max < self.calibration_samples_min_max:
-            if serial_port.in_waiting > 0:
-                new_data = serial_port.read(serial_port.in_waiting)
-                data_buffer.extend(new_data)
-                self.get_logger().debug(f"Read {len(new_data)} bytes for {hand_type} hand")
-                
-                while len(data_buffer) >= 132 and collected_min_max < self.calibration_samples_min_max:
-                    packet = bytes([data_buffer.popleft() for _ in range(132)])
+            if serial_port.in_waiting >= 132:
+                packet = serial_port.read(132)
+                if len(packet) == 132:
                     if self.is_valid_data(packet):
                         hand_data = self.unpack_data(packet, hand_type)
                         if hand_data:
@@ -221,8 +249,10 @@ class GloveNode(Node):
                                 last_progress_min_max = progress
                     else:
                         self.get_logger().debug(f"Invalid data packet for {hand_type} hand")
+                else:
+                    self.get_logger().error(f"Read incomplete packet: {len(packet)} bytes")
             else:
-                # 如果没有数据，等待一小段时间
+                # 如果没有足够的数据，等待一小段时间
                 time.sleep(0.001)
         
         print()
