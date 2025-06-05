@@ -129,9 +129,9 @@ class GloveNode(Node):
                 return False
                 
             # 检查数据包头部特征
-            if data[0] != 0xCB or data[1] != 0xCF:
-                self.get_logger().error(f"Invalid packet header: {[hex(b) for b in data[:2]]}")
-                return False
+            # if data[0] != 0xCB or data[1] != 0xCF:
+            #     self.get_logger().error(f"Invalid packet header: {[hex(b) for b in data[:2]]}")
+            #     return False
             
             # 检查CRC32
             received_crc = struct.unpack('<I', data[-4:])[0]
@@ -155,18 +155,23 @@ class GloveNode(Node):
         import sys
         # 左手最大最小值校准
         self.get_logger().info("Starting left hand min/max calibration...")
-        input("Press Enter to start left hand min/max calibration...")
+        input("Please keep your left hand still. Press Enter to start left hand min/max calibration...")
         self.calibrate_min_max('left')
         
         # 右手最大最小值校准
         self.get_logger().info("Starting right hand min/max calibration...")
-        input("Press Enter to start right hand min/max calibration...")
+        input("Please keep your right hand still. Press Enter to start right hand min/max calibration...")
         self.calibrate_min_max('right')
         
-        # 同时进行左右手静止平均值校准
-        self.get_logger().info("Starting static average calibration for both hands...")
-        input("Please keep both hands still. Press Enter to start the static average calibration...")
-        self.calibrate_static_average()
+        # 左手静止平均值校准
+        self.get_logger().info("Starting left hand static average calibration...")
+        input("Please keep your left hand still. Press Enter to start left hand static average calibration...")
+        self.calibrate_static_average('left')
+        
+        # 右手静止平均值校准
+        self.get_logger().info("Starting right hand static average calibration...")
+        input("Please keep your right hand still. Press Enter to start right hand static average calibration...")
+        self.calibrate_static_average('right')
         
         # 所有校准阶段完成后
         self.is_calibrated = True
@@ -202,9 +207,9 @@ class GloveNode(Node):
         self.get_logger().info(f"Starting data collection for {hand_type} hand...")
         
         # 先读取一些数据，确保数据流稳定
-        while serial_port.in_waiting > 0:
-            data = serial_port.read(serial_port.in_waiting)
-            self.get_logger().debug(f"Cleared {len(data)} bytes from buffer")
+        while serial_port.in_waiting >= 132:  # 只读取完整的132字节数据包
+            data = serial_port.read(132)
+            self.get_logger().debug(f"Cleared one complete packet of 132 bytes")
         time.sleep(0.1)
         
         # 检查串口状态
@@ -263,63 +268,58 @@ class GloveNode(Node):
         self.get_logger().info(f"Recorded max values: {max_val}")
         self.get_logger().info(f"Total samples collected: {collected_min_max}")
 
-    def calibrate_static_average(self):
-        """同时进行左右手的静止平均值校准"""
+    def calibrate_static_average(self, hand_type):
+        """分别进行左右手的静止平均值校准"""
         import sys
-        self.get_logger().info(f"Starting static average calibration, collecting {self.calibration_samples_avg} samples...")
+        self.get_logger().info(f"Starting {hand_type} hand static average calibration, collecting {self.calibration_samples_avg} samples...")
         
         # 初始化累加器
-        left_tensile_sums = [0] * 19
-        right_tensile_sums = [0] * 19
-        collected_avg = 0
-        last_progress_avg = -1
+        tensile_sums = [0] * 19
         
         # 清空缓冲区
-        self.left_data_buffer.clear()
-        self.right_data_buffer.clear()
+        if hand_type == 'left':
+            self.left_data_buffer.clear()
+            serial_port = self.left_serial_port
+        else:
+            self.right_data_buffer.clear()
+            serial_port = self.right_serial_port
         
         # 等待数据稳定
         time.sleep(1)
         
-        while collected_avg < self.calibration_samples_avg:
-            # 处理左手数据
-            if self.left_serial_port.in_waiting >= 132:
-                left_packet = self.left_serial_port.read(132)
-                if self.is_valid_data(left_packet):
-                    left_data = self.unpack_data(left_packet, 'left')
-                    if left_data:
+        collected = 0
+        last_progress = -1
+        
+        while collected < self.calibration_samples_avg:
+            if serial_port.in_waiting >= 132:
+                packet = serial_port.read(132)
+                if self.is_valid_data(packet):
+                    data = self.unpack_data(packet, hand_type)
+                    if data:
                         for i in range(19):
-                            left_tensile_sums[i] += left_data['tensile_data'][i]
-            
-            # 处理右手数据
-            if self.right_serial_port.in_waiting >= 132:
-                right_packet = self.right_serial_port.read(132)
-                if self.is_valid_data(right_packet):
-                    right_data = self.unpack_data(right_packet, 'right')
-                    if right_data:
-                        for i in range(19):
-                            right_tensile_sums[i] += right_data['tensile_data'][i]
-                        collected_avg += 1
-                        progress = int((collected_avg / self.calibration_samples_avg) * 50)
-                        if progress != last_progress_avg:
+                            tensile_sums[i] += data['tensile_data'][i]
+                        collected += 1
+                        progress = int((collected / self.calibration_samples_avg) * 50)
+                        if progress != last_progress:
                             bar = '[' + '#' * progress + '-' * (50 - progress) + ']'
-                            print(f"\rStatic average calibration in progress {bar} {collected_avg}/{self.calibration_samples_avg}", end='')
+                            print(f"\r{hand_type} hand calibration in progress {bar} {collected}/{self.calibration_samples_avg}", end='')
                             sys.stdout.flush()
-                            last_progress_avg = progress
-            
-            # 短暂等待，避免CPU占用过高
+                            last_progress = progress
             time.sleep(0.001)
         
         print()
-        # 计算平均值
-        if collected_avg > 0:
-            for i in range(19):
-                self.left_avg_val[i] = left_tensile_sums[i] / collected_avg
-                self.right_avg_val[i] = right_tensile_sums[i] / collected_avg
+        self.get_logger().info(f"{hand_type} hand static average calibration completed!")
         
-        self.get_logger().info("Static average calibration completed!")
-        self.get_logger().info(f"Left hand average values: {self.left_avg_val}")
-        self.get_logger().info(f"Right hand average values: {self.right_avg_val}")
+        # 计算平均值
+        if collected > 0:
+            if hand_type == 'left':
+                for i in range(19):
+                    self.left_avg_val[i] = tensile_sums[i] / collected
+            else:
+                for i in range(19):
+                    self.right_avg_val[i] = tensile_sums[i] / collected
+        
+        self.get_logger().info(f"{hand_type} hand average values: {self.left_avg_val if hand_type == 'left' else self.right_avg_val}")
 
     def read_and_publish_data(self, serial_port, data_buffer, hand_type):
         """读取串口数据并放入队列"""
@@ -450,12 +450,12 @@ class GloveNode(Node):
         """解析串口数据"""
         try:
             # First validate CRC
-            received_crc = struct.unpack('<I', data[-4:])[0]
-            computed_crc = zlib.crc32(data[:120]) & 0xFFFFFFFF
+            # received_crc = struct.unpack('<I', data[-4:])[0]
+            # computed_crc = zlib.crc32(data[:120]) & 0xFFFFFFFF
             
-            if computed_crc != received_crc:
-                self.get_logger().error(f"CRC validation failed: Computed={computed_crc:08X}, Received={received_crc:08X}")
-                return None
+            # if computed_crc != received_crc:
+            #     self.get_logger().error(f"CRC validation failed: Computed={computed_crc:08X}, Received={received_crc:08X}")
+            #     return None
 
             # Unpack the data fields separately to avoid alignment issues
             tensile_data = struct.unpack('<19i', data[:76])  # 19 integers (76 bytes)
