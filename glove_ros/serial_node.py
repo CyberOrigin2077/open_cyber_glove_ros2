@@ -92,7 +92,7 @@ class GloveNode(Node):
         """Initialize ONNX inference model"""
         self.get_logger().info("Inference mode enabled")
         pkg_share = get_package_share_directory('glove_ros')
-        model_path = os.path.join(pkg_share, 'model', '20250417_165613_test.onnx')
+        model_path = os.path.join(pkg_share, 'model', '20250605_143327_0526_0527_all_ensemble_mlp_pos_enc.onnx')
         self.get_logger().info(f"Loading model from: {model_path}")
         
         if not os.path.exists(model_path):
@@ -216,12 +216,12 @@ class GloveNode(Node):
         for hand_type in available_devices:
             # Min/max calibration
             self.get_logger().info(f"Starting {hand_type} hand min/max calibration...")
-            input(f"Please keep your {hand_type} hand still. Press Enter to start {hand_type} hand min/max calibration...")
+            input(f"{hand_type} calibration Pose 1: Make a fist and open your hand, multiple times. Press Enter to continue...")
             self._calibrate_min_max(hand_type)
             
             # Static average calibration
             self.get_logger().info(f"Starting {hand_type} hand static average calibration...")
-            input(f"Please keep your {hand_type} hand still. Press Enter to start {hand_type} hand static average calibration...")
+            input(f"{hand_type} calibration Pose 1: Make a fist and open your hand, multiple times. Press Enter to continue...")
             self._calibrate_static_average(hand_type)
         
         # Start threads for available devices
