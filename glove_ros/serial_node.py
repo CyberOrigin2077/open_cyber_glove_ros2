@@ -21,8 +21,6 @@ from queue import Empty
 class GloveNode(Node):
     # Protocol constants
     PACKET_SIZE = 132
-    PACKET_HEADER_1 = 0xCB
-    PACKET_HEADER_2 = 0xCF
     CRC_DATA_SIZE = 120
     
     # Data field offsets and sizes
@@ -48,10 +46,6 @@ class GloveNode(Node):
     DATA_BUFFER_SIZE = 5000
     DEFAULT_CALIBRATION_SAMPLES = 1000
     DEFAULT_BAUDRATE = 1000000
-    
-    # Validation thresholds
-    MAX_ACCELERATION = 100.0    # g-force
-    MAX_ANGULAR_VELOCITY = 2000.0  # degrees/second
     
     # Thread timing constants
     QUEUE_TIMEOUT_SHORT = 0.01  # 10ms
@@ -126,12 +120,19 @@ class GloveNode(Node):
         """Initialize worker threads only for available devices"""
         self.left_reader_thread = None
         self.right_reader_thread = None
+        self.left_process_thread = None
+        self.right_process_thread = None
         
         # Only create threads for available devices
         if self.left_serial_port is not None:
             self.left_reader_thread = Thread(
                 target=self._read_and_publish_data,
                 args=(self.left_serial_port, self.left_data_buffer, 'left'),
+                daemon=True
+            )
+            self.left_process_thread = Thread(
+                target=self._process_hand_data,
+                args=('left',),
                 daemon=True
             )
         
@@ -141,12 +142,11 @@ class GloveNode(Node):
                 args=(self.right_serial_port, self.right_data_buffer, 'right'),
                 daemon=True
             )
-        
-        # Always create processing thread
-        self.process_thread = Thread(
-            target=self._process_and_publish_data,
-            daemon=True
-        )
+            self.right_process_thread = Thread(
+                target=self._process_hand_data,
+                args=('right',),
+                daemon=True
+            )
 
     def _setup_serial_port(self, param_name, default_port):
         """Setup serial port with parameters, return None if device not available"""
@@ -232,7 +232,10 @@ class GloveNode(Node):
             self.left_reader_thread.start()
         if self.right_reader_thread is not None:
             self.right_reader_thread.start()
-        self.process_thread.start()
+        if self.left_process_thread is not None:
+            self.left_process_thread.start()
+        if self.right_process_thread is not None:
+            self.right_process_thread.start()
 
     def _calibrate_min_max(self, hand_type):
         """Calibrate min/max values for specified hand"""
@@ -346,7 +349,7 @@ class GloveNode(Node):
         """Clear complete packets from serial buffer"""
         while serial_port.in_waiting >= self.PACKET_SIZE:
             data = serial_port.read(self.PACKET_SIZE)
-            self.get_logger().debug("Cleared one complete packet of 132 bytes")
+            self.get_logger().debug(f"Cleared one complete packet of {self.PACKET_SIZE} bytes")
         time.sleep(0.1)
 
     def _log_serial_port_status(self, hand_type, serial_port):
@@ -417,33 +420,28 @@ class GloveNode(Node):
                             else:
                                 self.right_data_queue.put(hand_data)
 
-    def _process_and_publish_data(self):
-        """Process queued data and publish each hand independently"""
+    def _process_hand_data(self, hand_type):
+        """Process queued data and publish for specific hand"""
+        # Select the appropriate queue based on hand type
+        data_queue = self.left_data_queue if hand_type == 'left' else self.right_data_queue
+        
         while self.running:
             try:
-                # Process left hand data
-                try:
-                    left_data = self.left_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
-                    if self.inference_mode:
-                        left_data = self._perform_inference(left_data, 'left')
-                    self._publish_hand_data(left_data, 'left')
-                except Empty:
-                    pass
+                # Get data from the specific hand's queue
+                hand_data = data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
                 
-                # Process right hand data
-                try:
-                    right_data = self.right_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
-                    if self.inference_mode:
-                        right_data = self._perform_inference(right_data, 'right')
-                    self._publish_hand_data(right_data, 'right')
-                except Empty:
-                    pass
+                # Perform inference if enabled
+                if self.inference_mode:
+                    hand_data = self._perform_inference(hand_data, hand_type)
                 
-                # Small delay to prevent excessive CPU usage
+                # Publish the processed data
+                self._publish_hand_data(hand_data, hand_type)
+                
+            except Empty:
+                # No data available, continue with small delay
                 time.sleep(self.WAIT_TIME_SHORT)
-                
             except Exception as e:
-                self.get_logger().error(f"Error processing data: {e}")
+                self.get_logger().error(f"Error processing {hand_type} hand data: {e}")
                 time.sleep(self.WAIT_TIME_MEDIUM)
 
     def _perform_inference(self, hand_data, hand_type):
@@ -488,10 +486,8 @@ class GloveNode(Node):
         if self.inference_mode:
             msg.joint_angles = hand_data['inference'].tolist()
         
-        if hand_type == 'left':
-            self.left_glove_publisher.publish(msg)
-        else:
-            self.right_glove_publisher.publish(msg)
+        publisher = self.left_glove_publisher if hand_type == 'left' else self.right_glove_publisher
+        publisher.publish(msg)
 
     def stop(self):
         """Stop all threads and close serial ports"""
@@ -502,7 +498,10 @@ class GloveNode(Node):
             self.left_reader_thread.join()
         if self.right_reader_thread is not None:
             self.right_reader_thread.join()
-        self.process_thread.join()
+        if self.left_process_thread is not None:
+            self.left_process_thread.join()
+        if self.right_process_thread is not None:
+            self.right_process_thread.join()
         
         # Close serial ports if they exist
         if self.left_serial_port is not None:
