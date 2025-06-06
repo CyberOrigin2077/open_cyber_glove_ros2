@@ -63,8 +63,9 @@ class GloveNode(Node):
     def __init__(self):
         super().__init__('glove_node')
         
-        # Publisher setup
-        self.glove_publisher = self.create_publisher(GloveDataMsg, '/glove/data', 10)
+        # Publisher setup - separate publishers for each hand
+        self.left_glove_publisher = self.create_publisher(GloveDataMsg, '/glove/left/data', 10)
+        self.right_glove_publisher = self.create_publisher(GloveDataMsg, '/glove/right/data', 10)
         
         # Inference mode setup
         self.inference_mode = self.declare_parameter('inference_mode', False).value
@@ -122,24 +123,33 @@ class GloveNode(Node):
         self.right_avg_val = [0.0] * self.NUM_TENSILE_SENSORS
 
     def _init_threads(self):
-        """Initialize worker threads"""
-        self.left_reader_thread = Thread(
-            target=self._read_and_publish_data,
-            args=(self.left_serial_port, self.left_data_buffer, 'left'),
-            daemon=True
-        )
-        self.right_reader_thread = Thread(
-            target=self._read_and_publish_data,
-            args=(self.right_serial_port, self.right_data_buffer, 'right'),
-            daemon=True
-        )
+        """Initialize worker threads only for available devices"""
+        self.left_reader_thread = None
+        self.right_reader_thread = None
+        
+        # Only create threads for available devices
+        if self.left_serial_port is not None:
+            self.left_reader_thread = Thread(
+                target=self._read_and_publish_data,
+                args=(self.left_serial_port, self.left_data_buffer, 'left'),
+                daemon=True
+            )
+        
+        if self.right_serial_port is not None:
+            self.right_reader_thread = Thread(
+                target=self._read_and_publish_data,
+                args=(self.right_serial_port, self.right_data_buffer, 'right'),
+                daemon=True
+            )
+        
+        # Always create processing thread
         self.process_thread = Thread(
             target=self._process_and_publish_data,
             daemon=True
         )
 
     def _setup_serial_port(self, param_name, default_port):
-        """Setup serial port with parameters"""
+        """Setup serial port with parameters, return None if device not available"""
         port = self.declare_parameter(param_name, default_port).value
         
         # Declare baudrate parameter only once
@@ -154,8 +164,9 @@ class GloveNode(Node):
             self.get_logger().info(f"Successfully opened {param_name} on {port}")
             return ser
         except Exception as e:
-            self.get_logger().error(f"Failed to open {param_name} on {port}: {e}")
-            raise
+            self.get_logger().warn(f"Failed to open {param_name} on {port}: {e}")
+            self.get_logger().info(f"Device on {port} not available, continuing with single device operation")
+            return None
 
     def _is_valid_data(self, data):
         """Validate data packet integrity"""
@@ -183,43 +194,58 @@ class GloveNode(Node):
             return False
 
     def calibrate(self):
-        """Perform calibration sequence for both hands"""
-        # Left hand min/max calibration
-        self.get_logger().info("Starting left hand min/max calibration...")
-        input("Please keep your left hand still. Press Enter to start left hand min/max calibration...")
-        self._calibrate_min_max('left')
+        """Perform calibration sequence for available hands"""
+        available_devices = []
         
-        # Right hand min/max calibration
-        self.get_logger().info("Starting right hand min/max calibration...")
-        input("Please keep your right hand still. Press Enter to start right hand min/max calibration...")
-        self._calibrate_min_max('right')
+        # Check which devices are available
+        if self.left_serial_port is not None:
+            available_devices.append('left')
+        if self.right_serial_port is not None:
+            available_devices.append('right')
         
-        # Left hand static average calibration
-        self.get_logger().info("Starting left hand static average calibration...")
-        input("Please keep your left hand still. Press Enter to start left hand static average calibration...")
-        self._calibrate_static_average('left')
+        if not available_devices:
+            self.get_logger().error("No glove devices available for calibration!")
+            self.get_logger().error("Please check device connections and try again.")
+            # Exit the program gracefully
+            import sys
+            sys.exit(1)
         
-        # Right hand static average calibration
-        self.get_logger().info("Starting right hand static average calibration...")
-        input("Please keep your right hand still. Press Enter to start right hand static average calibration...")
-        self._calibrate_static_average('right')
+        self.get_logger().info(f"Found {len(available_devices)} device(s): {', '.join(available_devices)}")
         
-        # Start all threads after calibration
+        # Calibrate each available device
+        for hand_type in available_devices:
+            # Min/max calibration
+            self.get_logger().info(f"Starting {hand_type} hand min/max calibration...")
+            input(f"Please keep your {hand_type} hand still. Press Enter to start {hand_type} hand min/max calibration...")
+            self._calibrate_min_max(hand_type)
+            
+            # Static average calibration
+            self.get_logger().info(f"Starting {hand_type} hand static average calibration...")
+            input(f"Please keep your {hand_type} hand still. Press Enter to start {hand_type} hand static average calibration...")
+            self._calibrate_static_average(hand_type)
+        
+        # Start threads for available devices
         self.is_calibrated = True
         self.get_logger().info("Calibration complete!")
-        self.left_reader_thread.start()
-        self.right_reader_thread.start()
+        
+        if self.left_reader_thread is not None:
+            self.left_reader_thread.start()
+        if self.right_reader_thread is not None:
+            self.right_reader_thread.start()
         self.process_thread.start()
 
     def _calibrate_min_max(self, hand_type):
         """Calibrate min/max values for specified hand"""
+        # Check if device is available
+        serial_port, data_buffer, min_val, max_val = self._get_hand_parameters(hand_type)
+        if serial_port is None:
+            self.get_logger().error(f"{hand_type} hand device not available for calibration")
+            return
+        
         self.get_logger().info(
             f"Starting {hand_type} hand min/max calibration, "
             f"collecting {self.calibration_samples_min_max} samples..."
         )
-        
-        # Select hand-specific parameters
-        serial_port, data_buffer, min_val, max_val = self._get_hand_parameters(hand_type)
         
         # Reset calibration parameters
         min_val[:] = [self.SENSOR_MAX_VALUE] * self.NUM_TENSILE_SENSORS
@@ -259,6 +285,12 @@ class GloveNode(Node):
 
     def _calibrate_static_average(self, hand_type):
         """Calibrate static average values for specified hand"""
+        # Check if device is available
+        serial_port, data_buffer, _, _ = self._get_hand_parameters(hand_type)
+        if serial_port is None:
+            self.get_logger().error(f"{hand_type} hand device not available for calibration")
+            return
+        
         self.get_logger().info(
             f"Starting {hand_type} hand static average calibration, "
             f"collecting {self.calibration_samples_avg} samples..."
@@ -267,8 +299,7 @@ class GloveNode(Node):
         # Initialize accumulator
         tensile_sums = [0] * self.NUM_TENSILE_SENSORS
         
-        # Select hand-specific parameters
-        serial_port, data_buffer, _, _ = self._get_hand_parameters(hand_type)
+        # Clear buffer and wait for stable data
         data_buffer.clear()
         time.sleep(self.WAIT_TIME_LONG)
         
@@ -387,43 +418,29 @@ class GloveNode(Node):
                                 self.right_data_queue.put(hand_data)
 
     def _process_and_publish_data(self):
-        """Process queued data and publish combined messages"""
-        left_data = None
-        right_data = None
-        
+        """Process queued data and publish each hand independently"""
         while self.running:
             try:
-                # Try to get data from left queue
-                if left_data is None:
-                    try:
-                        left_data = self.left_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
-                    except Empty:
-                        pass
-                
-                # Try to get data from right queue
-                if right_data is None:
-                    try:
-                        right_data = self.right_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
-                    except Empty:
-                        pass
-                
-                # Process and publish when both hands have data
-                if left_data is not None and right_data is not None:
+                # Process left hand data
+                try:
+                    left_data = self.left_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
                     if self.inference_mode:
                         left_data = self._perform_inference(left_data, 'left')
-                        right_data = self._perform_inference(right_data, 'right')
-                    
-                    self._publish_combined_data(left_data, right_data)
-                    
-                    # Reset data
-                    left_data = None
-                    right_data = None
+                    self._publish_hand_data(left_data, 'left')
+                except Empty:
+                    pass
                 
-                # Wait strategy based on data availability
-                elif left_data is not None or right_data is not None:
-                    time.sleep(self.WAIT_TIME_SHORT)  # Wait for other hand
-                else:
-                    time.sleep(self.WAIT_TIME_MEDIUM)  # No data available
+                # Process right hand data
+                try:
+                    right_data = self.right_data_queue.get(timeout=self.QUEUE_TIMEOUT_SHORT)
+                    if self.inference_mode:
+                        right_data = self._perform_inference(right_data, 'right')
+                    self._publish_hand_data(right_data, 'right')
+                except Empty:
+                    pass
+                
+                # Small delay to prevent excessive CPU usage
+                time.sleep(self.WAIT_TIME_SHORT)
                 
             except Exception as e:
                 self.get_logger().error(f"Error processing data: {e}")
@@ -457,41 +474,41 @@ class GloveNode(Node):
         
         return hand_data
 
-    def _publish_combined_data(self, left_data, right_data):
-        """Publish combined left and right hand data"""
+    def _publish_hand_data(self, hand_data, hand_type):
+        """Publish hand data for specified hand type"""
         msg = GloveDataMsg()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
-        
-        # Left hand data
-        msg.left_linear_acceleration = list(left_data['acc_data'])
-        msg.left_angular_velocity = list(left_data['gyro_data'])
-        msg.left_temperature = float(left_data['temperature'])
-        msg.left_tensile_data = list(left_data['tensile_data'])
+        msg.linear_acceleration = list(hand_data['acc_data'])
+        msg.angular_velocity = list(hand_data['gyro_data'])
+        msg.temperature = float(hand_data['temperature'])
+        msg.tensile_data = list(hand_data['tensile_data'])
+        msg.timestamp = int(hand_data['timestamp'])
+
         if self.inference_mode:
-            msg.left_joint_angles = left_data['inference'].tolist()
+            msg.joint_angles = hand_data['inference'].tolist()
         
-        # Right hand data
-        msg.right_linear_acceleration = list(right_data['acc_data'])
-        msg.right_angular_velocity = list(right_data['gyro_data'])
-        msg.right_temperature = float(right_data['temperature'])
-        msg.right_tensile_data = list(right_data['tensile_data'])
-        if self.inference_mode:
-            msg.right_joint_angles = right_data['inference'].tolist()
-        
-        # Use left hand timestamp as reference
-        msg.timestamp = int(left_data['timestamp'])
-        
-        self.glove_publisher.publish(msg)
+        if hand_type == 'left':
+            self.left_glove_publisher.publish(msg)
+        else:
+            self.right_glove_publisher.publish(msg)
 
     def stop(self):
         """Stop all threads and close serial ports"""
         self.running = False
-        self.left_reader_thread.join()
-        self.right_reader_thread.join()
+        
+        # Join threads if they exist
+        if self.left_reader_thread is not None:
+            self.left_reader_thread.join()
+        if self.right_reader_thread is not None:
+            self.right_reader_thread.join()
         self.process_thread.join()
-        self.left_serial_port.close()
-        self.right_serial_port.close()
+        
+        # Close serial ports if they exist
+        if self.left_serial_port is not None:
+            self.left_serial_port.close()
+        if self.right_serial_port is not None:
+            self.right_serial_port.close()
 
     def _unpack_data(self, data, hand_type):
         """Unpack serial data into structured format"""
@@ -553,16 +570,25 @@ class GloveNode(Node):
 def main(args=None):
     """Main entry point"""
     rclpy.init(args=args)
-    node = GloveNode()
-    node.calibrate()
     
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
+        node = GloveNode()
+        node.calibrate()
+        
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            node.stop()
+            node.destroy_node()
+            
+    except SystemExit:
+        # Handle graceful exit when no devices are available
         pass
+    except Exception as e:
+        print(f"Error during initialization: {e}")
     finally:
-        node.stop()
-        node.destroy_node()
         rclpy.shutdown()
 
 
