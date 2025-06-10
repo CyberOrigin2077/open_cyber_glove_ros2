@@ -54,6 +54,8 @@ class GloveNode(Node):
     WAIT_TIME_MEDIUM = 0.01     # 10ms
     WAIT_TIME_LONG = 1.0        # 1s
 
+    SENSOR_ORDER = [3, 1, 0, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 2, 7, 11, 15]
+
     def __init__(self):
         super().__init__('glove_node')
         
@@ -92,7 +94,7 @@ class GloveNode(Node):
         """Initialize ONNX inference model"""
         self.get_logger().info("Inference mode enabled")
         pkg_share = get_package_share_directory('glove_ros')
-        model_path = os.path.join(pkg_share, 'model', '20250605_143327_0526_0527_all_ensemble_mlp_pos_enc.onnx')
+        model_path = os.path.join(pkg_share, 'model', '20250609_172101_0526_0527_all_finger_mlp.onnx')
         self.get_logger().info(f"Loading model from: {model_path}")
         
         if not os.path.exists(model_path):
@@ -221,7 +223,7 @@ class GloveNode(Node):
             
             # Static average calibration
             self.get_logger().info(f"Starting {hand_type} hand static average calibration...")
-            input(f"{hand_type} calibration Pose 1: Make a fist and open your hand, multiple times. Press Enter to continue...")
+            input(f"{hand_type} calibration Pose 2: Make your hand static, four fingers forward and thumb sticking out for 45 degrees. Press Enter to continue...")
             self._calibrate_static_average(hand_type)
         
         # Start threads for available devices
@@ -298,35 +300,57 @@ class GloveNode(Node):
             f"Starting {hand_type} hand static average calibration, "
             f"collecting {self.calibration_samples_avg} samples..."
         )
+        self.get_logger().info("Data will only be collected when sensors are still (diff < 10)")
         
-        # Initialize accumulator
+        # Initialize accumulator and tracking variables
         tensile_sums = [0] * self.NUM_TENSILE_SENSORS
+        last_tensile_data = None
+        collected = 0
+        last_progress = -1
+        skipped_samples = 0
         
         # Clear buffer and wait for stable data
         data_buffer.clear()
         time.sleep(self.WAIT_TIME_LONG)
         
         # Collect calibration data
-        collected = 0
-        last_progress = -1
-        
         while collected < self.calibration_samples_avg:
             if serial_port.in_waiting >= self.PACKET_SIZE:
                 packet = serial_port.read(self.PACKET_SIZE)
                 if self._is_valid_data(packet):
                     data = self._unpack_data(packet, hand_type)
                     if data:
-                        for i in range(self.NUM_TENSILE_SENSORS):
-                            tensile_sums[i] += data['tensile_data'][i]
-                        collected += 1
-                        last_progress = self._update_progress_bar(
-                            collected, self.calibration_samples_avg,
-                            f"{hand_type} hand calibration in progress", last_progress
-                        )
+                        current_tensile_data = data['tensile_data']
+                        
+                        # Check if sensors are still (only if we have previous data)
+                        if last_tensile_data is not None:
+                            is_still = self._check_sensors_still(
+                                current_tensile_data, 
+                                last_tensile_data, 
+                                threshold=10
+                            )
+                            
+                            if is_still:
+                                # Sensors are still, collect this sample
+                                for i in range(self.NUM_TENSILE_SENSORS):
+                                    tensile_sums[i] += current_tensile_data[i]
+                                collected += 1
+                                last_progress = self._update_progress_bar(
+                                    collected, self.calibration_samples_avg,
+                                    f"{hand_type} hand static calibration", last_progress
+                                )
+                            else:
+                                # Sensors are moving, skip this sample
+                                skipped_samples += 1
+                        
+                        # Update last data for next comparison
+                        last_tensile_data = current_tensile_data
+                        
             time.sleep(self.WAIT_TIME_SHORT)
         
         print()
         self.get_logger().info(f"{hand_type} hand static average calibration completed!")
+        self.get_logger().info(f"Collected {collected} still samples, skipped {skipped_samples} moving samples")
         
         # Calculate and store averages
         if collected > 0:
@@ -335,6 +359,14 @@ class GloveNode(Node):
                 avg_values[i] = tensile_sums[i] / collected
         
         self.get_logger().info(f"{hand_type} hand average values: {avg_values}")
+
+    def _check_sensors_still(self, current_data, last_data, threshold=10):
+        """Check if sensors are still by comparing consecutive readings"""
+        for i in range(self.NUM_TENSILE_SENSORS):
+            diff = abs(current_data[i] - last_data[i])
+            if diff >= threshold:
+                return False  # Movement detected
+        return True  # All sensors are still
 
     def _get_hand_parameters(self, hand_type):
         """Get hand-specific parameters"""
@@ -465,6 +497,9 @@ class GloveNode(Node):
 
         # Reshape for model input
         model_input = tensile_difference.reshape(1, -1)
+
+        # Reorder the data based on the SENSOR_ORDER
+        model_input = model_input[:, self.SENSOR_ORDER]
         
         # Run inference
         outputs = self.ort_sess.run(None, {'input': model_input})
