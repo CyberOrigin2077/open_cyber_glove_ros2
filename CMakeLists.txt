@@ -17,15 +17,17 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 ament_export_dependencies(rosidl_default_runtime)
 
 install(
-  DIRECTORY model
-  DESTINATION share/${PROJECT_NAME}
-)
-
-install(
   PROGRAMS
     glove_ros/serial_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME serial_node
+)
+
+install(
+  PROGRAMS
+    glove_ros/visualizer_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME visualizer_node
 )
 
 ament_package()
