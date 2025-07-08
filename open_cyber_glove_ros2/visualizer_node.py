@@ -21,7 +21,7 @@ class VisualizerNode(Node):
         self._create_ros_interfaces()
 
     def _create_ros_interfaces(self):
-        qos_profile = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
         
         self.create_subscription(GloveDataMsg, '/glove/left/data', self.left_callback, qos_profile)
         self.get_logger().info("Subscribed to LEFT hand topic: /glove/left/data")
