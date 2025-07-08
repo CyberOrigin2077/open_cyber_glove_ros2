@@ -77,7 +77,7 @@ class GloveNode(Node):
     
     def _process_hand_data(self, hand_type):
         """Process queued data and publish for specific hand"""
-        while True:
+        while rclpy.ok():
             try:
                 data = self.glove.get_data(hand_type=hand_type)
                 angles = np.zeros(22)
