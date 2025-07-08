@@ -116,9 +116,7 @@ class GloveNode(Node):
         msg.temperature = float(hand_data['temperature'])
         msg.tensile_data = list(hand_data['tensile_data'])
         msg.timestamp = int(hand_data['timestamp'])
-
-        if self.inference_mode:
-            msg.joint_angles = hand_data['inference'].tolist()
+        msg.joint_angles = hand_data['inference'].tolist()
         
         publisher = self.left_glove_publisher if hand_type == 'left' else self.right_glove_publisher
         publisher.publish(msg)

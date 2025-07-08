@@ -2,8 +2,6 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
-# ROS 2 标准和自定义消息类型
 from open_cyber_glove_ros2.msg import GloveDataMsg
 from open_cyber_glove.visualizer import HandVisualizer
 
@@ -52,7 +50,6 @@ def main(args=None):
     node = None
     try:
         node = VisualizerNode()
-        # 既然是硬编码，我们直接检查模型是否初始化成功
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('Keyboard interrupt, shutting down.')
