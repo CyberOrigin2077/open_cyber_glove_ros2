@@ -15,6 +15,8 @@ from open_cyber_glove import OpenCyberGlove
 class GloveNode(Node):
     def __init__(self):
         super().__init__('glove_node')
+        self.WAIT_TIME_SHORT = 0.01
+        self.WAIT_TIME_MEDIUM = 1.0
         
         # Publisher setup - separate publishers for each hand
         self.left_glove_publisher = self.create_publisher(GloveDataMsg, '/glove/left/data', 10)
