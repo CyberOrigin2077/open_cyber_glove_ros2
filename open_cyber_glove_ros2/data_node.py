@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Header
-from glove_ros.msg import GloveDataMsg
+from open_cyber_glove_ros2.msg import GloveDataMsg
 from threading import Thread
 import os
 import time

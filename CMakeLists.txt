@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(glove_ros)
+project(open_cyber_glove_ros2)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclpy REQUIRED)
@@ -18,14 +18,14 @@ ament_export_dependencies(rosidl_default_runtime)
 
 install(
   PROGRAMS
-    glove_ros/serial_node.py
+    open_cyber_glove_ros2/data_node.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME serial_node
+  RENAME data_node
 )
 
 install(
   PROGRAMS
-    glove_ros/visualizer_node.py
+    open_cyber_glove_ros2/visualizer_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME visualizer_node
 )

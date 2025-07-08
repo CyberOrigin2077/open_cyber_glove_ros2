@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 # ROS 2 标准和自定义消息类型
-from glove_ros.msg import GloveDataMsg
+from open_cyber_glove_ros2.msg import GloveDataMsg
 from open_cyber_glove.visualizer import HandVisualizer
 
 
