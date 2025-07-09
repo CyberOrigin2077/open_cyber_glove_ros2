@@ -5,10 +5,8 @@ from rclpy.node import Node
 from std_msgs.msg import Header
 from open_cyber_glove_ros2.msg import GloveDataMsg
 from threading import Thread
-import os
 import time
 import numpy as np
-from ament_index_python.packages import get_package_share_directory
 from queue import Empty
 from open_cyber_glove import OpenCyberGlove
 
