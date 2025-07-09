@@ -150,7 +150,7 @@ def main(args=None):
         # Handle graceful exit when no devices are available
         pass
     except Exception as e:
-        print(f"Error during initialization: {e}")
+        self.get_logger().error(f"Error during initialization: {e}")
     finally:
         rclpy.shutdown()
 
