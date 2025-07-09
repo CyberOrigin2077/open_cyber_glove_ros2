@@ -15,7 +15,7 @@ Before using this ROS2 package, you need to set up the OpenCyberGlove library. P
 Clone this repository into your ROS 2 workspace `src` folder:
 ```bash
 cd ~/ros2_ws/src
-git clone <repo-url> open_cyber_glove_ros2
+git clone https://github.com/CyberOrigin2077/open_cyber_glove_ros2.git open_cyber_glove_ros2
 ```
 
 Build the package with `colcon`:
