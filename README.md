@@ -79,8 +79,20 @@ ros2 run open_cyber_glove_ros2 visualizer_node --ros-args \
   -p hand_model_path:=/path/to/hand/model
 ```
 
+#### Publish Joint Markers for RViz
+To publish joint and bone markers for visualization in RViz, set the `publish_joints` parameter to `true`:
+
+```bash
+ros2 run open_cyber_glove_ros2 visualizer_node --ros-args \
+  -p hand_model_path:=/path/to/hand/model \
+  -p publish_joints:=true
+```
+
+This will publish a `visualization_msgs/MarkerArray` message to the `/joints_position` topic, which can be visualized in RViz.
+
 #### Parameters
-- `hand_model_path` (string): Path to hand model for visualization (default: "")
+- `hand_model_path` (string): Path to hand model for visualization (default: `""`)
+- `publish_joints` (bool): Whether to publish joint and bone markers for RViz (default: `false`)
 
 #### Running Both Nodes
 You can run both nodes simultaneously in separate terminals:
@@ -95,8 +107,10 @@ ros2 run open_cyber_glove_ros2 data_node --ros-args \
 **Terminal 2:**
 ```bash
 ros2 run open_cyber_glove_ros2 visualizer_node --ros-args \
-  -p hand_model_path:=/path/to/hand/model
+  -p hand_model_path:=/path/to/hand/model \
+  -p publish_joints:=true
 ```
+
 
 ## 3. Published Topics and Message Definitions
 
@@ -145,6 +159,11 @@ The `visualizer_node` subscribes to the same topics to visualize the hand moveme
 - **Subscribes to**: `/glove/left/data` and `/glove/right/data`
 - **Message Type**: `open_cyber_glove_ros2/GloveDataMsg`
 - **Function**: Updates 3D hand visualization based on joint angles
+
+If `publish_joints` is enabled, the node also publishes:
+- **Topic**: `/joints_position`
+- **Message Type**: `visualization_msgs/MarkerArray`
+- **Description**: Contains joint and bone markers for visualization in RViz
 
 ## License
 BSD 3-Clause License
